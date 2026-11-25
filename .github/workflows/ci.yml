@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  unit-zero-dep:
+    name: Zero-Dep Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Run unittest suite with zero external dependencies
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Run offline Strands example smoke test
+        env:
+          PYTHONPATH: .
+        run: python3 examples/strands_enterprise_agent.py --offline-demo
+
+      - name: Verify zero runtime dependencies and zero Unicode em-dashes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          deps = pyproject["project"]["dependencies"]
+          assert deps == [], f"Expected zero runtime dependencies, got: {deps}"
+
+          forbidden = "\u2014"
+          suffixes = {".py", ".md", ".yaml", ".yml", ".toml", ".json", ".txt", ".sh"}
+          for path in sorted(Path(".").rglob("*")):
+              if not path.is_file() or ".git" in path.parts:
+                  continue
+              if path.suffix in suffixes or path.name == "LICENSE":
+                  text = path.read_text(encoding="utf-8")
+                  if forbidden in text:
+                      raise SystemExit(f"Forbidden Unicode em-dash found in {path}")
+          print("Zero runtime dependencies and zero em-dashes verified.")
+          PY
+
+  strands-sdk-integration:
+    name: Strands Agents SDK Integration (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package with strands-agents optional dependency
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ".[strands]"
+
+      - name: Run unittest suite with strands-agents installed
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Verify Strands @tool wrapping, HookProvider, and Agent schema discovery
+        env:
+          AWS_DEFAULT_REGION: us-west-2
+          AWS_REGION: us-west-2
+        run: |
+          python3 - <<'PY'
+          import yaml
+          from pathlib import Path
+          from strands import Agent
+          from strands.hooks import HookProvider
+          from strands.tools.decorator import DecoratedFunctionTool, tool
+          from strands.types.tools import AgentTool
+
+          from knot_strands import (
+              KnotClient,
+              KnotStrandsHookProvider,
+              KnotToolset,
+              is_strands_available,
+              knot_commit_decision,
+              knot_get_active_state,
+              knot_memory,
+          )
+
+          assert is_strands_available() is True
+
+          for t in (knot_memory, knot_commit_decision, knot_get_active_state):
+              assert isinstance(t, AgentTool), f"{t} is not an AgentTool"
+              assert isinstance(t, DecoratedFunctionTool), f"{t} is not DecoratedFunctionTool"
+
+          rewrapped = tool(knot_memory._tool_func)
+          assert isinstance(rewrapped, DecoratedFunctionTool)
+
+          client = KnotClient(
+              api_key="ci-test-token",
+              base_url="http://127.0.0.1:18080",
+              domain="ci-integration",
+          )
+          hook = KnotStrandsHookProvider(
+              client=client,
+              user_id="usr_ci",
+              domain="ci-integration",
+          )
+          assert isinstance(hook, HookProvider)
+
+          agent = Agent(
+              tools=[knot_memory, knot_commit_decision, knot_get_active_state],
+              hooks=[hook],
+          )
+          assert set(agent.tool_names) == {
+              "knot_memory",
+              "knot_commit_decision",
+              "knot_get_active_state",
+          }, f"Unexpected agent tools: {agent.tool_names}"
+
+          specs = {s["name"]: s for s in agent.tool_registry.get_all_tool_specs()}
+          mem_props = specs["knot_memory"]["inputSchema"]["json"]["properties"]
+          for key in ("action", "content", "query", "user_id", "entity_key", "domain", "as_of", "supersedes"):
+              assert key in mem_props, f"Missing {key} in Agent tool spec"
+
+          toolset = KnotToolset(client=client, user_id="usr_ci", domain="ci-integration")
+          pinned_agent = Agent(tools=toolset.tools, hooks=[hook])
+          assert set(pinned_agent.tool_names) == {
+              "knot_memory",
+              "knot_commit_decision",
+              "knot_get_active_state",
+          }
+
+          helm_values = yaml.safe_load(
+              Path("deploy/aws-eks-agentcore/aws-eks-values.yaml").read_text(encoding="utf-8")
+          )
+          assert helm_values["env"]["KNOT_ALLOW_REMOTE_MODELS"] == "false"
+          assert helm_values["kms"]["enabled"] is True
+          assert helm_values["agentCoreGateway"]["enabled"] is True
+          print("Strands SDK integration and Agent schema discovery verified.")
+          PY

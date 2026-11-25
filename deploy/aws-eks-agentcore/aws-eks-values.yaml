@@ -1,0 +1,104 @@
+# Knot EnterpriseBrain AWS EKS + AWS KMS + Amazon Bedrock AgentCore Gateway Helm Values
+# Chart reference: charts/knot-enterprisebrain (https://connectknot.com/enterprise-brain/reference)
+#
+# Bedrock AgentCore Gateway Setup Instructions:
+# 1. Deploy this Helm chart inside your private EKS cluster with internal ALB/NLB ingress.
+# 2. Verify preflight readiness in the knot-api pod: `knot-enterprisebrain --doctor`.
+# 3. Create an Amazon Bedrock AgentCore Gateway target pointing to the in-VPC MCP URL:
+#      Target URL: https://knot-internal.your-vpc.internal/mcp
+#      Transport:  Streamable HTTP (MCP)
+#      Auth Mode:  OAuth2 JWKS or AWS SigV4 / PrivateLink VPC Endpoint
+# 4. Attach your AWS Strands Agents SDK runtime using `knot_strands`:
+#      export KNOT_BASE_URL="https://knot-internal.your-vpc.internal/v1"
+#      export KNOT_DOMAIN="enterprise-platform"
+# 5. Keep KNOT_ALLOW_REMOTE_MODELS="false" for strict zero-egress execution, or bind
+#    Amazon Bedrock PrivateLink when model-assisted ingestion is explicitly permitted.
+
+global:
+  deploymentMode: self_hosted
+  tenancyModel: subject_domain
+
+image:
+  repository: ghcr.io/connectknot/knot-enterprisebrain
+  tag: "1.1.0"
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: knot-enterprisebrain
+  annotations:
+    # EKS IRSA role granting kms:Decrypt, kms:GenerateDataKey, and SQS/Aurora access.
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/knot-enterprisebrain-eks-irsa"
+
+env:
+  KNOT_DEPLOYMENT_MODE: "self_hosted"
+  KNOT_TENANCY_MODEL: "subject_domain"
+  KNOT_ALLOW_REMOTE_MODELS: "false"
+  KNOT_LLM_PROVIDER: "none"
+  KNOT_EMBEDDER_MODE: "local_onnx"
+  KNOT_LICENSE_OFFLINE_GRACE_DAYS: "14"
+  KNOT_PCI_WRITE_DOOR_ENFORCED: "true"
+  KNOT_SECRET_ENTROPY_THRESHOLD: "3.55"
+
+secrets:
+  # Inject DATABASE_URL and KNOT_ORG_LICENSE via AWS Secrets Manager CSI Driver or ExternalSecrets.
+  existingSecretName: "knot-enterprisebrain-secrets"
+
+kms:
+  enabled: true
+  provider: "aws_kms"
+  region: "us-west-2"
+  authMethod: "irsa_sigv4"
+  keyAlias: "alias/knot-enterprisebrain-root"
+  keyHierarchy: "hkdf_3_level"
+  hkdfLevels:
+    - "K_org_root"
+    - "K_domain"
+    - "K_subject"
+  orthogonalVectorRotation: true
+  cryptoErasureEndpointEnabled: true
+
+database:
+  provider: "aws_aurora_postgres"
+  pgvectorEnabled: true
+  sslMode: "verify-full"
+
+ingestWorker:
+  enabled: true
+  replicas: 2
+  source: "aws_sqs"
+  queueUrl: "https://sqs.us-west-2.amazonaws.com/123456789012/knot-ingest-events"
+  deadLetterScrubbing: true
+
+ingress:
+  enabled: true
+  className: "alb"
+  annotations:
+    alb.ingress.kubernetes.io/scheme: "internal"
+    alb.ingress.kubernetes.io/target-type: "ip"
+    alb.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+  hosts:
+    - host: "knot-internal.your-vpc.internal"
+      paths:
+        - path: /
+          pathType: Prefix
+
+networkPolicy:
+  enabled: true
+  egressAllowOnly:
+    - "aws_aurora_postgres"
+    - "aws_kms_vpc_endpoint"
+    - "aws_sqs_vpc_endpoint"
+
+agentCoreGateway:
+  enabled: true
+  mcpEndpointPath: "/mcp"
+  restBasePath: "/v1"
+  authProtocol: "oauth2_jwks_or_mtls"
+  gatewayTargetName: "knot-enterprisebrain-vpc"
+  gatewayTargetInstructions: |
+    Register https://knot-internal.your-vpc.internal/mcp as a Bedrock AgentCore Gateway
+    MCP target via AWS PrivateLink / VPC Lattice. Map agent execution roles to
+    knot-policy.yaml domain ranks so lower-authority Strands agents cannot overwrite
+    canonical system-of-record domains.
